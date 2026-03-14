@@ -1,0 +1,30 @@
+
+# Python virtual environment
+voice_env/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Piper voice models (large files — too big for Git)
+piper-voices/
+
+# Audio test files
+*.wav
+*.mp3
+
+# Log files
+*.log
+
+# Environment variables / API keys
+.env
+*.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
