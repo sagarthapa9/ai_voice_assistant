@@ -504,7 +504,7 @@ After scp finishes, SSH into the remote device and navigate to the copied folder
 
 |                                  |
 |----------------------------------|
-| ssh sagar@192.168.0.38           |
+| ssh sagar@192.172.0.45           |
 | cd ~/projects/ai_voice_assistant |
 
 Confirm all three files are present:
