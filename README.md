@@ -476,7 +476,7 @@ If you want to copy the project from your laptop to another machine on the same 
 
 |                                                           |
 |-----------------------------------------------------------|
-| scp -r ./ai_voice_assistant sagar@192.168.0.38:~/projects |
+| scp -r ./ai_voice_assistant sagar@192.172.0.45:~/projects |
 
 |                          |                                                           |
 |--------------------------|-----------------------------------------------------------|
@@ -484,7 +484,7 @@ If you want to copy the project from your laptop to another machine on the same 
 | **scp**                  | Secure Copy — copies files over the network via SSH       |
 | **-r**                   | Recursive — copies the entire folder, not just one file   |
 | **./ai_voice_assistant** | The folder on your local machine you want to copy         |
-| **sagar@192.168.0.38**   | Username and IP address of the target device (your Radxa) |
+| **sagar@192.172.0.45**   | Username and IP address of the target device (your Radxa) |
 | **:~/projects**          | Destination path on the remote device (~/projects folder) |
 
 <table>
@@ -777,29 +777,138 @@ If the assistant feels slow at any stage — listening, transcribing, or thinkin
 <tbody>
 <tr class="odd">
 <td><p><strong>Summary of all speed and quality improvements</strong></p>
-<p>Whisper tiny + beam_size=1 → approximately 3x faster transcription</p>
-<p>qwen2.5:0.5b or 1.5b → approximately 10x faster LLM responses</p>
-<p>Piper TTS → significantly more natural sounding voice</p>
-<p>Shorter silence_duration → less dead time after you finish speaking</p></td>
+<p>Fix _rms normalisation bug + calibrate silence_threshold → silence detected instantly</p>
+<p>silence_duration 0.6 + chunk_size 200ms → saves ~0.9s per turn during recording</p>
+<p>faster-whisper tiny int8 → approximately 4x faster transcription than standard Whisper</p>
+<p>qwen2.5:0.5b or 1.5b → approximately 10x faster LLM responses than 7B</p>
+<p>Piper TTS → significantly more natural sounding voice than espeak-ng</p></td>
 </tr>
 </tbody>
 </table>
 
-**Fix 1 — Slow transcribing (Whisper)**
+**Fix 1 — Slow listening (audio recording)**
 
-Switch from the base model to tiny, and tell Whisper to stop running multiple passes. Open assistant.py:
+The silence detection settings control how long the assistant waits after you stop speaking before it starts transcribing. Reducing these cuts dead time at the end of every turn.
 
-|                   |
-|-------------------|
-| nano assistant.py |
+In the CONFIG block in assistant.py change:
 
-In the CONFIG block at the top, change:
+|                                                                          |
+|--------------------------------------------------------------------------|
+| "silence_threshold": 0.005, \# calibrated to your microphone — see below |
+| "silence_duration": 0.6, \# was 1.5 — stops recording sooner             |
 
-|                                     |
-|-------------------------------------|
-| "whisper_model": "tiny",            |
-| "whisper_device": "cpu",            |
-| "silence_duration": 0.8, \# was 1.5 |
+Also increase the audio chunk size in the AudioRecorder to reduce Python loop overhead during recording. Find this line in the record_until_silence method:
+
+|                                                           |
+|-----------------------------------------------------------|
+| chunk_size = int(self.sample_rate \* 0.1) \# 100ms chunks |
+
+Change it to:
+
+|                                                                               |
+|-------------------------------------------------------------------------------|
+| chunk_size = int(self.sample_rate \* 0.2) \# 200ms chunks — less CPU overhead |
+
+|                             |                                                                             |
+|-----------------------------|-----------------------------------------------------------------------------|
+| **Setting**                 | **What it does**                                                            |
+| **silence_threshold 0.005** | Sits above background noise floor, below speech — calibrated value          |
+| **silence_duration 0.6**    | Stops recording after 0.6s of silence instead of 1.5s — saves 0.9s per turn |
+| **chunk_size 200ms**        | Fewer Python loop iterations per second — less CPU overhead while recording |
+
+**Important — fix the RMS normalisation bug first**
+
+The **\_rms** method in the original **AudioRecorder** class has a bug — it calculates RMS on raw int16 values (range -32768 to +32767) instead of normalised float values (range -1.0 to +1.0). This means the threshold values in CONFIG are on a completely different scale to what the code is actually measuring, so silence detection never works correctly.
+
+Find the \_rms method in assistant.py:
+
+|                                                         |
+|---------------------------------------------------------|
+| def \_rms(self, data):                                  |
+| return np.sqrt(np.mean(data.astype(np.float32) \*\* 2)) |
+
+Replace it with this corrected version:
+
+|                                                                   |
+|-------------------------------------------------------------------|
+| def \_rms(self, data):                                            |
+| \# Normalise int16 range (-32768 to 32767) to float (-1.0 to 1.0) |
+| normalised = data.astype(np.float32) / 32768.0                    |
+| return np.sqrt(np.mean(normalised \*\* 2))                        |
+
+|                  |                                        |
+|------------------|----------------------------------------|
+| **Version**      | **What it measures**                   |
+| **Old (broken)** | Raw int16 amplitude — scale of tens    |
+| **New (fixed)**  | Normalised float — scale of 0.0 to 1.0 |
+
+**How to calibrate silence_threshold for your microphone**
+
+Every microphone and room has a different background noise floor. Rather than guessing, measure it first. Save this as a file called rms_test.py:
+
+|                                                                             |
+|-----------------------------------------------------------------------------|
+| import sounddevice as sd                                                    |
+| import numpy as np                                                          |
+|                                                                             |
+| print('Silence test — stay quiet...')                                       |
+| rec = sd.rec(int(5 \* 16000), samplerate=16000, channels=1, dtype='int16')  |
+| sd.wait()                                                                   |
+| for i, chunk in enumerate(rec.reshape(-1, 1600)\[:10\]):                    |
+| rms = np.sqrt(np.mean((chunk.astype('float32') / 32768.0) \*\* 2))          |
+| print(f'Chunk {i:02d}: RMS = {rms:.6f}')                                    |
+|                                                                             |
+| print('Now speak normally for 3 seconds...')                                |
+| rec2 = sd.rec(int(3 \* 16000), samplerate=16000, channels=1, dtype='int16') |
+| sd.wait()                                                                   |
+| for i, chunk in enumerate(rec2.reshape(-1, 1600)):                          |
+| rms = np.sqrt(np.mean((chunk.astype('float32') / 32768.0) \*\* 2))          |
+| print(f'Speech {i:02d}: RMS = {rms:.6f}')                                   |
+
+Run it with:
+
+|                     |
+|---------------------|
+| python3 rms_test.py |
+
+Run this twice — once in silence, once while speaking. Then set silence_threshold to a value clearly between the two:
+
+|                 |                 |
+|-----------------|-----------------|
+| **Silence RMS** | **Speech RMS**  |
+| **~0.0009**     | ~0.017 to 0.030 |
+| **~0.002**      | ~0.020 to 0.040 |
+| **~0.005**      | ~0.030 to 0.060 |
+| **~0.010**      | ~0.050 to 0.080 |
+
+The rule is: set threshold to roughly 5 times your silence RMS value. This gives enough gap above background noise that hum and breathing never trigger it, while still catching speech immediately.
+
+<table>
+<colgroup>
+<col style="width: 100%" />
+</colgroup>
+<tbody>
+<tr class="odd">
+<td><p><strong>Real calibration result — Jabra EVOLVE 20 on Radxa</strong></p>
+<p>Silence floor: RMS = 0.0009</p>
+<p>Speech peak: RMS = 0.030</p>
+<p>Threshold set: 0.005 (5.5x above noise floor, 6x below speech start)</p></td>
+</tr>
+</tbody>
+</table>
+
+**Fix 2 — Slow transcribing (Whisper)**
+
+Two options here — quick wins with standard Whisper, or a full replacement with faster-whisper which is 4x faster on CPU.
+
+**Option A — tune standard Whisper (quick fix)**
+
+In the CONFIG block change:
+
+|                          |
+|--------------------------|
+| "whisper_model": "tiny", |
+| "whisper_device": "cpu", |
 
 Then find the transcribe method inside the WhisperSTT class and replace the model.transcribe call with:
 
@@ -818,13 +927,71 @@ Then find the transcribe method inside the WhisperSTT class and replace the mode
 |                          |                                                                |
 |--------------------------|----------------------------------------------------------------|
 | **Setting**              | **What it does**                                               |
-| **tiny instead of base** | Smaller model — roughly 3x faster with minimal accuracy loss   |
+| **tiny instead of base** | Smaller model — roughly 3x faster, minimal accuracy loss       |
 | **beam_size=1**          | Stops Whisper running multiple passes — biggest single speedup |
 | **best_of=1**            | Only generates one candidate transcription instead of several  |
 | **temperature=0**        | Deterministic output — no random sampling overhead             |
-| **silence_duration=0.8** | Cuts 0.7 seconds of dead time after you stop speaking          |
 
-**Fix 2 — Slow thinking (LLM)**
+**Option B — replace with faster-whisper (recommended)**
+
+faster-whisper is a reimplementation of Whisper using CTranslate2. It runs approximately **4x faster** on CPU and uses less memory than standard Whisper. This is the most impactful single change you can make to listening speed.
+
+Install it:
+
+|                            |
+|----------------------------|
+| pip install faster-whisper |
+
+Then replace the entire WhisperSTT class in assistant.py with this:
+
+|                                                                               |
+|-------------------------------------------------------------------------------|
+| class WhisperSTT:                                                             |
+| def \_\_init\_\_(self, model_name="tiny", device="cpu"):                      |
+| from faster_whisper import WhisperModel                                       |
+| console.print(f"\[cyan\]Loading faster-whisper \[{model_name}\]...\[/cyan\]") |
+| self.model = WhisperModel(                                                    |
+| model_name,                                                                   |
+| device=device,                                                                |
+| compute_type="int8", \# 8-bit quantisation — faster on ARM CPU                |
+| )                                                                             |
+| console.print("\[green\]✓ faster-whisper loaded\[/green\]")                   |
+|                                                                               |
+| def transcribe(self, audio_path: str, language="en") -\> str:                 |
+| segments, \_ = self.model.transcribe(                                         |
+| audio_path,                                                                   |
+| language=language,                                                            |
+| beam_size=1,                                                                  |
+| best_of=1,                                                                    |
+| temperature=0,                                                                |
+| vad_filter=True, \# skips silent parts automatically                          |
+| vad_parameters=dict(                                                          |
+| min_silence_duration_ms=300,                                                  |
+| ),                                                                            |
+| )                                                                             |
+| return " ".join(s.text.strip() for s in segments)                             |
+
+|                                 |                                                                                    |
+|---------------------------------|------------------------------------------------------------------------------------|
+| **Setting**                     | **What it does**                                                                   |
+| **compute_type="int8"**         | Runs inference in 8-bit integers instead of 32-bit floats — ~4x faster on ARM      |
+| **vad_filter=True**             | Built-in voice activity detection — skips silent audio before it reaches the model |
+| **min_silence_duration_ms=300** | Treats gaps over 300ms as silence — prevents splitting mid-sentence                |
+| **beam_size=1 + temperature=0** | Single pass, no sampling — fastest possible transcription                          |
+
+<table>
+<colgroup>
+<col style="width: 100%" />
+</colgroup>
+<tbody>
+<tr class="odd">
+<td><p><strong>Verify faster-whisper is installed in the virtual environment</strong></p>
+<p>Make sure (voice_env) is shown in your prompt before running pip install faster-whisper. Installing outside the venv means the assistant will not find it when it runs.</p></td>
+</tr>
+</tbody>
+</table>
+
+**Fix 3 — Slow thinking (LLM)**
 
 Pull a smaller model. The 0.5B model fits under 1 GB RAM and responds in 2 to 4 seconds on Radxa:
 
@@ -865,7 +1032,7 @@ Change it to:
 | **qwen2.5:3b**   | ~4 GB          |
 | **qwen2.5:7b**   | ~8 GB          |
 
-**Fix 3 — Robotic voice (TTS)**
+**Fix 4 — Robotic voice (TTS)**
 
 The default pyttsx3 uses espeak-ng which sounds very robotic. Replace it with **Piper** — a natural sounding TTS designed specifically for ARM edge devices like the Radxa.
 
@@ -1053,3 +1220,272 @@ If something is not working, these commands show you what is happening:
 | **sudo systemctl status voice-assistant** | Check if the service is running                          |
 | **tail -f /tmp/voice_assistant.log**      | Watch live log output                                    |
 | **ollama serve**                          | Start Ollama manually if it stopped                      |
+
+**Wake Word**
+
+Adding Alexa activation to the Voice Assistant
+
+*How to make the assistant sleep until you say Alexa — just like a real smart speaker — using openWakeWord running locally on the Radxa*
+
+A wake word means the assistant stays completely silent and uses almost no CPU until it hears a specific trigger word. Only after hearing that word does it activate, play a beep, and start listening for your actual question. This is exactly how Alexa, Google Home, and Siri work.
+
+<table>
+<colgroup>
+<col style="width: 100%" />
+</colgroup>
+<tbody>
+<tr class="odd">
+<td><p><strong>What gets added</strong></p>
+<p>openWakeWord — lightweight wake word detection library designed for edge devices</p>
+<p>alexa_v0.1.onnx — the Alexa detection model (runs via ONNX Runtime on CPU)</p>
+<p>WakeWordDetector class — new class added to assistant.py</p>
+<p>Updated run() loop — waits for Alexa before every turn</p></td>
+</tr>
+</tbody>
+</table>
+
+**01 Install openWakeWord**
+
+Install the library into your virtual environment:
+
+|                                 |
+|---------------------------------|
+| source ~/voice_env/bin/activate |
+| pip install openwakeword        |
+
+Check which version installed — the API differs between versions:
+
+|                       |
+|-----------------------|
+| pip show openwakeword |
+
+This guide is written for version 0.4.0. If you have a different version the Model initialisation arguments may differ.
+
+**02 Download the Alexa Wake Word Model**
+
+Version 0.4.0 requires you to pass the full path to an ONNX model file directly — there are no bundled models. Download the Alexa model manually:
+
+|                                                                                        |
+|----------------------------------------------------------------------------------------|
+| mkdir -p ~/wake-models                                                                 |
+| cd ~/wake-models                                                                       |
+| wget https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/alexa_v0.1.onnx |
+
+Verify it downloaded correctly:
+
+|                       |
+|-----------------------|
+| ls -lh ~/wake-models/ |
+
+Expected output:
+
+|                        |
+|------------------------|
+| alexa_v0.1.onnx ~1.2MB |
+
+Save as test_wake.py and run with python3 test_wake.py to confirm the model loads:
+
+|                                                                     |
+|---------------------------------------------------------------------|
+| from openwakeword.model import Model                                |
+| m = Model(                                                          |
+| wakeword_model_paths=\['/home/sagar/wake-models/alexa_v0.1.onnx'\], |
+| vad_threshold=0.0,                                                  |
+| )                                                                   |
+| print('Loaded:', list(m.models.keys()))                             |
+
+You should see: Loaded: \['alexa_v0.1'\]
+
+<table>
+<colgroup>
+<col style="width: 100%" />
+</colgroup>
+<tbody>
+<tr class="odd">
+<td><p><strong>Other available wake words</strong></p>
+<p>alexa_v0.1.onnx — say Alexa</p>
+<p>hey_jarvis_v0.1.onnx — say Hey Jarvis</p>
+<p>hey_mycroft_v0.1.onnx — say Hey Mycroft</p>
+<p>ok_nabu_v0.1.onnx — say OK Nabu</p>
+<p>All available at the same GitHub release URL — just swap the filename.</p></td>
+</tr>
+</tbody>
+</table>
+
+**03 Add WakeWordDetector to assistant.py**
+
+Add these entries to the CONFIG block:
+
+|                                                                     |
+|---------------------------------------------------------------------|
+| "wake_word_model": "/home/sagar/wake-models/alexa_v0.1.onnx",       |
+| "wake_word_threshold": 0.5, \# 0.0 to 1.0 — higher = less sensitive |
+
+Add this new class to assistant.py above the VoiceAssistant class:
+
+|                                                                                      |
+|--------------------------------------------------------------------------------------|
+| class WakeWordDetector:                                                              |
+| def \_\_init\_\_(self, model_path: str, threshold: float = 0.5):                     |
+| from openwakeword.model import Model                                                 |
+| console.print("\[cyan\]Loading wake word model (Alexa)...\[/cyan\]")                 |
+| self.model = Model(                                                                  |
+| wakeword_model_paths=\[model_path\],                                                 |
+| vad_threshold=0.0,                                                                   |
+| )                                                                                    |
+| self.threshold = threshold                                                           |
+| self.chunk_size = 1280 \# 80ms at 16000 Hz — required by openWakeWord                |
+| console.print("\[green\]✓ Wake word model loaded — say Alexa to activate\[/green\]") |
+|                                                                                      |
+| def listen_for_wake_word(self):                                                      |
+| console.print("\[dim\]Waiting for wake word — say Alexa...\[/dim\]")                 |
+| with sd.InputStream(                                                                 |
+| samplerate=16000, channels=1, dtype='int16',                                         |
+| blocksize=self.chunk_size,                                                           |
+| ) as stream:                                                                         |
+| \# Drain first 20 chunks to flush audio device buffer                                |
+| \# and clear openWakeWord internal sliding window                                    |
+| for \_ in range(20):                                                                 |
+| stream.read(self.chunk_size)                                                         |
+| \# Reset model state after draining                                                  |
+| try:                                                                                 |
+| self.model.reset()                                                                   |
+| except AttributeError:                                                               |
+| for key in self.model.prediction_buffer:                                             |
+| self.model.prediction_buffer\[key\].clear()                                          |
+| console.print("\[dim\]Ready — say Alexa\[/dim\]")                                    |
+| while True:                                                                          |
+| chunk, \_ = stream.read(self.chunk_size)                                             |
+| prediction = self.model.predict(chunk.flatten())                                     |
+| score = list(prediction.values())\[0\]                                               |
+| if score \>= self.threshold:                                                         |
+| console.print(f"\[green\]✓ Alexa detected! (score={score:.2f})\[/green\]")           |
+| return                                                                               |
+
+Update VoiceAssistant \_\_init\_\_ to load the detector as the first component:
+
+|                                            |
+|--------------------------------------------|
+| self.wake = WakeWordDetector(              |
+| model_path=CONFIG\['wake_word_model'\],    |
+| threshold=CONFIG\['wake_word_threshold'\], |
+| )                                          |
+
+Update the run() loop to wait for wake word before each turn and add a pause after detection:
+
+|                                                        |
+|--------------------------------------------------------|
+| while self.running:                                    |
+| try:                                                   |
+| \# 1. Wait for wake word                               |
+| self.wake.listen_for_wake_word()                       |
+|                                                        |
+| \# Pause so Alexa sound clears before recording starts |
+| time.sleep(0.5)                                        |
+|                                                        |
+| \# 2. Record question                                  |
+| audio_path = self.recorder.record_until_silence()      |
+| \# ... rest of loop unchanged                          |
+
+Also update the startup message in run():
+
+|                                                                 |
+|-----------------------------------------------------------------|
+| self.tts.speak("Voice assistant ready. Say Alexa to activate.") |
+
+**04 Issues Encountered and How They Were Fixed**
+
+Several problems came up when integrating the wake word. Each one and its fix is documented here.
+
+**Issue 1 — Wake word being transcribed as the question**
+
+After Alexa was detected, the recorder started immediately and captured the tail end of the word Alexa — so the LLM received **Alexa.** as the question instead of the actual query.
+
+**Fix:** Add a 0.5 second pause between detection and recording:
+
+|                                                            |
+|------------------------------------------------------------|
+| self.wake.listen_for_wake_word()                           |
+| time.sleep(0.5) \# let Alexa sound finish before mic opens |
+| audio_path = self.recorder.record_until_silence()          |
+
+**Issue 2 — False wake word trigger immediately after response**
+
+After the assistant spoke a response, the wake word detector immediately fired again without anyone saying Alexa. This happened because the openWakeWord model carried over audio context from the previous detection in its internal sliding window buffer — when the stream reopened it still contained residual audio that scored above the threshold.
+
+**Fix:** Drain the first 20 audio chunks after opening the stream to flush the device buffer and room echo, then reset the model state:
+
+|                                                               |
+|---------------------------------------------------------------|
+| with sd.InputStream(...) as stream:                           |
+| \# Flush 20 chunks (~1.6s) — clears device buffer + room echo |
+| for \_ in range(20):                                          |
+| stream.read(self.chunk_size)                                  |
+| \# Clear model internal sliding window                        |
+| try:                                                          |
+| self.model.reset()                                            |
+| except AttributeError:                                        |
+| for key in self.model.prediction_buffer:                      |
+| self.model.prediction_buffer\[key\].clear()                   |
+
+|                                         |                                                |
+|-----------------------------------------|------------------------------------------------|
+| **Problem**                             | **Root cause**                                 |
+| **Alexa transcribed as question**       | Recorder started while Alexa still audible     |
+| **Immediate re-trigger after response** | Model buffer retained previous detection audio |
+| **False trigger from speaker echo**     | Mic picked up TTS speaker output               |
+
+<table>
+<colgroup>
+<col style="width: 100%" />
+</colgroup>
+<tbody>
+<tr class="odd">
+<td><p><strong>Why 20 chunks</strong></p>
+<p>Each chunk is 1280 samples at 16000 Hz = 80ms. Twenty chunks = 1600ms = 1.6 seconds. This covers: the audio device hardware buffer (~100ms), any room reverberation decay (~300ms), and the full openWakeWord sliding context window (~900ms). Discarding all of this ensures the model starts scoring genuinely fresh audio.</p></td>
+</tr>
+</tbody>
+</table>
+
+**05 Tuning the Wake Word Threshold**
+
+The threshold controls how confident the model must be before triggering. A score of 1.0 means absolute certainty, 0.0 means no detection.
+
+|               |                                       |
+|---------------|---------------------------------------|
+| **Threshold** | **Behaviour**                         |
+| **0.3**       | Very sensitive — triggers easily      |
+| **0.5**       | Balanced — good starting point        |
+| **0.7**       | Strict — requires clear pronunciation |
+| **0.9**       | Very strict — may miss some attempts  |
+
+Change it in CONFIG in assistant.py:
+
+|                                                                            |
+|----------------------------------------------------------------------------|
+| "wake_word_threshold": 0.5, \# adjust up or down based on your environment |
+
+**06 Final Wake Word Flow**
+
+With wake word fully integrated, the complete conversation loop looks like this:
+
+|                                                               |
+|---------------------------------------------------------------|
+| Start → speaks: Voice assistant ready. Say Alexa to activate. |
+| → drains 20 chunks (~1.6s flush)                              |
+| → waiting for Alexa...                                        |
+|                                                               |
+| You say Alexa                                                 |
+| → detected (score=0.93+)                                      |
+| → 0.5s pause                                                  |
+| → beep (start chime)                                          |
+| → Listening...                                                |
+|                                                               |
+| You ask your question                                         |
+| → stop beep                                                   |
+| → Transcribing...                                             |
+| → Thinking...                                                 |
+| → speaks response                                             |
+|                                                               |
+| → drains 20 chunks (~1.6s flush)                              |
+| → waiting for Alexa... ← back to start                        |
