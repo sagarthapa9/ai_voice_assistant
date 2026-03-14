@@ -27,6 +27,9 @@ from rich.panel import Panel
 from rich.text import Text
 from rich import print as rprint
 
+# Suppress ONNX Runtime GPU warning
+os.environ["ORT_DISABLE_GPU"] = "1"
+
 # ─── Config ──────────────────────────────────────────────────────────────────
 
 CONFIG = {
@@ -35,6 +38,9 @@ CONFIG = {
     "model": "qwen3.5:0.8b",           # Ollama model tag for Qwen3.5 0.8B
     "num_predict": 80,
 
+    # Wake word settings
+    "wake_word_model": "/home/sagar/wake-models/alexa_v0.1.onnx",
+    "wake_word_threshold": 0.5,        # 0.0 to 1.0 — higher = less sensitive
 
     # Whisper STT settings
     "whisper_model": "tiny",          # tiny | base | small | medium
@@ -75,7 +81,54 @@ logging.basicConfig(
 )
 log = logging.getLogger("VoiceAssistant")
 console = Console()
+# ─── Wake Word Detector ───────────────────────────────────────────────────────
+ 
+class WakeWordDetector:
+    def __init__(self, model_path: str, threshold: float = 0.5):
+        from openwakeword.model import Model
+        console.print("[cyan]Loading wake word model (Alexa)...[/cyan]")
+        self.model = Model(
+            wakeword_model_paths=[model_path],
+            vad_threshold=0.0,
+        )
+        self.threshold = threshold
+        self.chunk_size = 1280   # 80ms at 16000 Hz — required by openWakeWord
+        console.print("[green]✓ Wake word model loaded — say 'Alexa' to activate[/green]")
+ 
+    def listen_for_wake_word(self):
+        """Block until 'Alexa' is detected. Returns when heard."""
+        console.print("[dim]Waiting for wake word — say 'Alexa'...[/dim]")
 
+        with sd.InputStream(
+            samplerate=16000,
+            channels=1,
+            dtype="int16",
+            blocksize=self.chunk_size,
+        ) as stream:
+            # Drain first 20 chunks (~1.6 seconds) to flush:
+            # 1. Audio device buffer leftover from speaker playback
+            # 2. openWakeWord internal sliding window from last detection
+            # 3. Any room echo/reverb still decaying
+            for _ in range(20):
+                stream.read(self.chunk_size)
+
+            # Reset model state after draining
+            try:
+                self.model.reset()
+            except AttributeError:
+                for key in self.model.prediction_buffer:
+                    self.model.prediction_buffer[key].clear()
+
+            console.print("[dim]Ready — say 'Alexa'[/dim]")
+
+            # Now actually listen for wake word
+            while True:
+                chunk, _ = stream.read(self.chunk_size)
+                prediction = self.model.predict(chunk.flatten())
+                score = list(prediction.values())[0]
+                if score >= self.threshold:
+                    console.print(f"[green]✓ Alexa detected! (score={score:.2f})[/green]")
+                    return
 # ─── STT: Whisper ─────────────────────────────────────────────────────────────
 class WhisperSTT:
     def __init__(self, model_name="tiny", device="cpu"):
@@ -112,14 +165,6 @@ class AudioRecorder:
         self.silence_threshold = silence_threshold
         self.silence_duration = silence_duration
         self.max_seconds = max_seconds
-
-    # def _beep(self, frequency=880, duration=0.12, volume=0.3):
-    #     """Play a short beep through the default audio device."""
-    #     t = np.linspace(0, duration, int(48000 * duration), endpoint=False)
-    #     tone = (np.sin(2 * np.pi * frequency * t) * volume * 32767).astype(np.int16)
-    #     stereo = np.column_stack([tone, tone])
-    #     sd.play(stereo.astype(np.float32) / 32767, 48000, device=0)
-    #     sd.wait()
 
     def _beep(self, style="start"):
         """
@@ -314,6 +359,10 @@ class VoiceAssistant:
             "[dim]Radxa Dragon Q6A · faster-whisper · Qwen3.5 2B · pyttsx3 TTS[/dim]",
             border_style="cyan",
         ))
+        self.wake = WakeWordDetector(
+            model_path=CONFIG["wake_word_model"],
+            threshold=CONFIG["wake_word_threshold"],
+        )
 
         self.stt = WhisperSTT(
             model_name=CONFIG["whisper_model"],
@@ -343,16 +392,23 @@ class VoiceAssistant:
         sys.exit(0)
 
     def run(self):
-        self.tts.speak("Voice assistant ready. How can I help you?")
+        #self.tts.speak("Voice assistant ready. How can I help you?")
+        self.tts.speak("Voice assistant ready. Say Alexa to activate.")
 
         while self.running:
             try:
-                # 1. Record
+                # 1. Wait for wake word
+                self.wake.listen_for_wake_word()
+
+                # Short pause so the word "Alexa" is not captured in the recording
+                time.sleep(0.5)
+
+                # 2. Record
                 audio_path = self.recorder.record_until_silence()
                 if not audio_path:
                     continue
 
-                # 2. Transcribe
+                # 3. Transcribe
                 console.print("[cyan]Transcribing...[/cyan]")
                 t0 = time.time()
                 text = self.stt.transcribe(audio_path, language=CONFIG["language"])
