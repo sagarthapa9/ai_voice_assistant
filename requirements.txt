@@ -1,0 +1,24 @@
+# AI Voice Assistant — Python Requirements
+# Install with: pip install -r requirements.txt
+
+# STT
+openai-whisper>=20231117
+
+# Audio I/O
+sounddevice>=0.4.6
+soundfile>=0.12.1
+pyaudio>=0.2.14
+numpy>=1.24.0
+
+# LLM client
+requests>=2.31.0
+
+# TTS
+pyttsx3>=2.90
+
+# UI / logging
+rich>=13.0.0
+
+# PyTorch (CPU build for ARM64 / Radxa)
+# Install separately:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
