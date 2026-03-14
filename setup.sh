@@ -41,9 +41,9 @@ sudo systemctl start ollama  2>/dev/null || ollama serve &
 sleep 3
 
 # ── 3. Pull Qwen3.5:4b ───────────────────────────────────────────
-info "Pulling Qwen3.5:4b model (this may take 5-15 minutes)..."
-ollama pull qwen3.5:4b
-success "Qwen3.5:4b ready"
+info "Pulling Qwen3.5:2b model (this may take 5-15 minutes)..."
+ollama pull qwen3.5:2b
+success "Qwen3.5:2b ready"
 
 # ── 4. Python virtual environment ─────────────────────────────────
 info "Creating Python virtual environment..."

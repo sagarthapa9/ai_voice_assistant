@@ -32,7 +32,7 @@ from rich import print as rprint
 CONFIG = {
     # Ollama / LLM settings
     "ollama_url": "http://localhost:11434/api/generate",
-    "model": "qwen2.5:1.5b",           # Ollama model tag for Qwen2.5 1.5B
+    "model": "qwen3.5:0.8b",           # Ollama model tag for Qwen3.5 0.8B
     "num_predict": 80,
 
 
@@ -44,8 +44,8 @@ CONFIG = {
     # Audio recording settings
     "sample_rate": 16000,
     "channels": 1,
-    "silence_threshold": 0.01,        # RMS threshold to detect silence
-    "silence_duration": 0.8,          # seconds of silence before stopping
+    "silence_threshold": 0.005,        # RMS threshold to detect silence
+    "silence_duration": 0.6,          # seconds of silence before stopping
     "max_record_seconds": 30,
 
     # TTS settings
@@ -60,7 +60,6 @@ CONFIG = {
         "You are a helpful, concise voice assistant running on a Radxa Dragon Q6A "
         "edge device. Keep responses short and natural for spoken conversation. "
         "Avoid markdown, bullet points, or special formatting — speak in plain sentences."
-        "/no_think"
     ),
 }
 
@@ -78,32 +77,30 @@ log = logging.getLogger("VoiceAssistant")
 console = Console()
 
 # ─── STT: Whisper ─────────────────────────────────────────────────────────────
-
 class WhisperSTT:
-    def __init__(self, model_name="base", device="cpu"):
-        console.print(f"[cyan]Loading Whisper [{model_name}] on {device}...[/cyan]")
-        self.model = whisper.load_model(model_name, device=device)
-        console.print("[green]✓ Whisper loaded[/green]")
+    def __init__(self, model_name="tiny", device="cpu"):
+        from faster_whisper import WhisperModel
+        console.print(f"[cyan]Loading faster-whisper [{model_name}]...[/cyan]")
+        self.model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type="int8",   # int8 quantisation — faster on CPU
+        )
+        console.print("[green]✓ faster-whisper loaded[/green]")
 
     def transcribe(self, audio_path: str, language="en") -> str:
-        # result = self.model.transcribe(
-        #     audio_path,
-        #     language=language,
-        #     fp16=False,
-        #     condition_on_previous_text=False,
-        # )
-        result = self.model.transcribe(
+        segments, _ = self.model.transcribe(
             audio_path,
-            language="en",
-            fp16=False,
-            condition_on_previous_text=False,
-            temperature=0,
-            best_of=1,
+            language=language,
             beam_size=1,
-   )
-        return result["text"].strip()
-
-
+            best_of=1,
+            temperature=0,
+            vad_filter=True,       # skips silent parts automatically
+            vad_parameters=dict(
+                min_silence_duration_ms=300,
+            ),
+        )
+        return " ".join(s.text.strip() for s in segments)
 # ─── Audio Recorder ──────────────────────────────────────────────────────────
 
 class AudioRecorder:
@@ -116,16 +113,69 @@ class AudioRecorder:
         self.silence_duration = silence_duration
         self.max_seconds = max_seconds
 
+    # def _beep(self, frequency=880, duration=0.12, volume=0.3):
+    #     """Play a short beep through the default audio device."""
+    #     t = np.linspace(0, duration, int(48000 * duration), endpoint=False)
+    #     tone = (np.sin(2 * np.pi * frequency * t) * volume * 32767).astype(np.int16)
+    #     stereo = np.column_stack([tone, tone])
+    #     sd.play(stereo.astype(np.float32) / 32767, 48000, device=0)
+    #     sd.wait()
+
+    def _beep(self, style="start"):
+        """
+        Play a polished chime.
+        style='start' — rising two-tone (like Alexa wake confirmation)
+        style='stop'  — falling single tone with soft fade (like Google done)
+        """
+        sr = 48000
+
+        if style == "start":
+            # Rising two-tone chime — short low note then higher note
+            def tone(freq, dur, fade=0.015):
+                t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+                wave = np.sin(2 * np.pi * freq * t)
+                # Smooth fade in and out
+                fade_samples = int(sr * fade)
+                wave[:fade_samples] *= np.linspace(0, 1, fade_samples)
+                wave[-fade_samples:] *= np.linspace(1, 0, fade_samples)
+                return wave
+
+            # Two notes: 880 Hz then 1174 Hz (a musical fifth apart)
+            note1 = tone(880,  0.10) * 0.35
+            gap   = np.zeros(int(sr * 0.02))   # 20ms gap between notes
+            note2 = tone(1174, 0.14) * 0.40
+            audio = np.concatenate([note1, gap, note2])
+
+        elif style == "stop":
+            # Falling tone with pitch sweep — smooth and satisfying
+            dur = 0.18
+            t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+            # Frequency glides down from 880 to 660 Hz
+            freq = np.linspace(880, 660, len(t))
+            wave = np.sin(2 * np.pi * np.cumsum(freq) / sr)
+            # Bell-curve volume envelope — soft attack and decay
+            envelope = np.exp(-((t - dur * 0.3) ** 2) / (2 * (dur * 0.25) ** 2))
+            audio = (wave * envelope * 0.45)
+
+        # Convert to stereo float32 and play
+        stereo = np.column_stack([audio, audio]).astype(np.float32)
+        sd.play(stereo, sr, device=0)
+        sd.wait()
+
     def _rms(self, data):
-        return np.sqrt(np.mean(data.astype(np.float32) ** 2))
+        # Normalise int16 range (-32768 to 32767) to float (-1.0 to 1.0)
+        normalised = data.astype(np.float32) / 32768.0
+        return np.sqrt(np.mean(normalised ** 2))
 
     def record_until_silence(self) -> str:
         """Record until silence detected, return path to wav file."""
         console.print("[yellow]🎙  Listening... (speak now)[/yellow]")
+        self._beep(style="start")   #start listening
 
         audio_chunks = []
         silent_chunks = 0
-        chunk_size = int(self.sample_rate * 0.1)   # 100 ms chunks
+        #chunk_size = int(self.sample_rate * 0.1)   # 100 ms chunks
+        chunk_size = int(self.sample_rate * 0.2) # 200 ms chunks for more stable silence detection
         silence_limit = int(self.silence_duration / 0.1)
         max_chunks = int(self.max_seconds / 0.1)
         recording_started = False
@@ -150,6 +200,7 @@ class AudioRecorder:
                     audio_chunks.append(data.copy())
 
                 if recording_started and silent_chunks >= silence_limit:
+                    self._beep(style="stop")   #stopped listening
                     break
 
         if not audio_chunks:
@@ -172,7 +223,7 @@ class QwenLLM:
 
     def _build_prompt(self, user_msg: str) -> str:
         """Build Qwen chat-format prompt."""
-        parts = [f"<|im_start|>system\n{self.system_prompt}/no_think<|im_end|>"]
+        parts = [f"<|im_start|>system\n{self.system_prompt}<|im_end|>"]
         for turn in self.history:
             role = turn["role"]
             parts.append(f"<|im_start|>{role}\n{turn['content']}<|im_end|>")
@@ -187,6 +238,7 @@ class QwenLLM:
             "model": self.model,
             "prompt": prompt,
             "stream": False,
+            "think": False,
             "options": {
                 "temperature": 0.7,
                 "top_p": 0.9,
@@ -196,7 +248,7 @@ class QwenLLM:
         }
 
         try:
-            resp = requests.post(self.url, json=payload, timeout=30)
+            resp = requests.post(self.url, json=payload, timeout=60) # longer timeout for first inference
             resp.raise_for_status()
             data = resp.json()
             answer = data.get("response", "").strip()
@@ -219,26 +271,6 @@ class QwenLLM:
 
 
 # ─── TTS ─────────────────────────────────────────────────────────────────────
-
-# class TextToSpeech:
-#     def __init__(self, rate=175, volume=0.9):
-#         self.engine = pyttsx3.init()
-#         self.engine.setProperty("rate", rate)
-#         self.engine.setProperty("volume", volume)
-#         # Try to pick a natural voice
-#         voices = self.engine.getProperty("voices")
-#         if voices:
-#             # Prefer English voices
-#             for v in voices:
-#                 if "english" in v.name.lower() or "en" in v.id.lower():
-#                     self.engine.setProperty("voice", v.id)
-#                     break
-
-#     def speak(self, text: str):
-#         console.print(f"[green]🔊 Speaking:[/green] {text}")
-#         self.engine.say(text)
-#         self.engine.runAndWait()
-
 class TextToSpeech:
     def __init__(self):
         from piper import PiperVoice
@@ -246,17 +278,6 @@ class TextToSpeech:
             "/home/sagar/piper-voices/en_US-lessac-medium.onnx",
             config_path="/home/sagar/piper-voices/en_US-lessac-medium.onnx.json",
         )
-
-    # def speak(self, text: str):
-    #     console.print(f"[green]🔊 Speaking:[/green] {text}")
-    #     import wave, io
-    #     with io.BytesIO() as buf:
-    #         with wave.open(buf, 'wb') as wav:
-    #             self.voice.synthesize(text, wav)
-    #         buf.seek(0)
-    #         data, samplerate = sf.read(buf)
-    #     sd.play(data, samplerate)
-    #     sd.wait()
 
     def speak(self, text: str):
         console.print(f"[green]🔊 Speaking:[/green] {text}")
@@ -290,7 +311,7 @@ class VoiceAssistant:
     def __init__(self):
         console.print(Panel.fit(
             "[bold cyan]AI Voice Assistant[/bold cyan]\n"
-            "[dim]Radxa Dragon Q6A · Whisper STT · Qwen2.5 7B · pyttsx3 TTS[/dim]",
+            "[dim]Radxa Dragon Q6A · faster-whisper · Qwen3.5 2B · pyttsx3 TTS[/dim]",
             border_style="cyan",
         ))
 
@@ -303,10 +324,7 @@ class VoiceAssistant:
             model=CONFIG["model"],
             system_prompt=CONFIG["system_prompt"],
         )
-        # self.tts = TextToSpeech(
-        #     rate=CONFIG["tts_rate"],
-        #     volume=CONFIG["tts_volume"],
-        # )
+
         self.tts = TextToSpeech()
         self.recorder = AudioRecorder(
             sample_rate=CONFIG["sample_rate"],

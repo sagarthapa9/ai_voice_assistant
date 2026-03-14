@@ -2,7 +2,8 @@
 # Install with: pip install -r requirements.txt
 
 # STT
-openai-whisper>=20231117
+#openai-whisper>=20231117
+faster-whisper>=1.0.0
 
 # Audio I/O
 sounddevice>=0.4.6
@@ -15,10 +16,12 @@ requests>=2.31.0
 
 # TTS
 pyttsx3>=2.90
+piper-tts>=1.2.0
 
 # UI / logging
 rich>=13.0.0
-
+#Audio processing
+scipy>=1.10.0
 # PyTorch (CPU build for ARM64 / Radxa)
 # Install separately:
 # pip install torch --index-url https://download.pytorch.org/whl/cpu
