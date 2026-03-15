@@ -26,6 +26,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 from rich import print as rprint
+from openai import OpenAI
 
 # Suppress ONNX Runtime GPU warning
 os.environ["ORT_DISABLE_GPU"] = "1"
@@ -36,6 +37,10 @@ CONFIG = {
     # Ollama / LLM settings
     "ollama_url": "http://localhost:11434/api/generate",
     "model": "qwen3.5:0.8b",           # Ollama model tag for Qwen3.5 0.8B
+
+    "deepseek_api_key": "enter api key here",  # or load from env
+    "llm_model": "deepseek-chat",
+
     "num_predict": 80,
 
     # Wake word settings
@@ -256,6 +261,44 @@ class AudioRecorder:
         sf.write(tmp.name, audio_np, self.sample_rate, subtype="PCM_16")
         return tmp.name
 
+# ─── Smart Light Controller ───────────────────────────────────────────────────
+
+import socket
+
+class SmartLight:
+    def __init__(self, ip: str):
+        self.ip = ip
+
+    def _send(self, data: dict, attr: list):
+        payload = json.dumps({
+            "msg": {"data": data, "attr": attr},
+            "pv": 0,
+            "cmd": 3,
+            "sn": str(int(time.time() * 1000))
+        }) + "\r\n"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(5)
+                s.connect((self.ip, 5555))
+                s.sendall(payload.encode())
+            return True
+        except Exception as e:
+            log.error(f"SmartLight error: {e}")
+            return False
+
+    def turn_on(self):       return self._send({"1": 1}, [1])
+    def turn_off(self):      return self._send({"1": 0}, [1])
+    def set_brightness(self, level: int):
+        return self._send({"3": max(0, min(1000, level))}, [3])
+    def set_color(self, h: int, s=1000, v=1000):
+        return self._send({
+            "2": 1,
+            "3": int(v / 1000 * 65535),
+            "5": int(h / 360 * 65535),
+            "6": int(s / 1000 * 65535)
+        }, [2, 3, 5, 6])
+    def set_white(self, brightness=800, temp=500):
+        return self._send({"2": 0, "3": brightness, "5": 65535, "6": 65535}, [2, 3, 5, 6])
 
 # ─── LLM: Qwen via Ollama ────────────────────────────────────────────────────
 
@@ -359,6 +402,8 @@ class VoiceAssistant:
             "[dim]Radxa Dragon Q6A · faster-whisper · Qwen3.5 2B · pyttsx3 TTS[/dim]",
             border_style="cyan",
         ))
+        self.light = SmartLight(ip="192.168.0.43")
+
         self.wake = WakeWordDetector(
             model_path=CONFIG["wake_word_model"],
             threshold=CONFIG["wake_word_threshold"],
@@ -369,9 +414,10 @@ class VoiceAssistant:
             device=CONFIG["whisper_device"],
         )
         self.llm = QwenLLM(
+            #api_key=CONFIG["deepseek_api_key"],
             ollama_url=CONFIG["ollama_url"],
             model=CONFIG["model"],
-            system_prompt=CONFIG["system_prompt"],
+            system_prompt=CONFIG["system_prompt"]
         )
 
         self.tts = TextToSpeech()
@@ -390,6 +436,47 @@ class VoiceAssistant:
         self.running = False
         console.print("\n[red]Shutting down...[/red]")
         sys.exit(0)
+
+    def handle_light_command(self, text: str) -> str | None:
+        t = text.lower().strip()
+
+        if any(w in t for w in ["turn on", "switch on", "lights on", "light on"]):
+            self.light.turn_on()
+            return "Light turned on."
+
+        if any(w in t for w in ["turn off", "switch off", "lights off", "light off"]):
+            self.light.turn_off()
+            return "Light turned off."
+
+        if "dim" in t or "darker" in t or "low" in t:
+            self.light.set_brightness(300)
+            return "Light dimmed."
+
+        if "bright" in t or "full" in t or "max" in t:
+            self.light.set_brightness(1000)
+            return "Light set to full brightness."
+
+        if "warm" in t:
+            self.light.set_white(brightness=800, temp=200)
+            return "Warm white light set."
+
+        if "cool" in t or "daylight" in t:
+            self.light.set_white(brightness=800, temp=900)
+            return "Cool daylight light set."
+
+        if "red" in t:
+            self.light.set_color(h=0)
+            return "Light set to red."
+
+        if "green" in t:
+            self.light.set_color(h=120)
+            return "Light set to green."
+
+        if "blue" in t:
+            self.light.set_color(h=240)
+            return "Light set to blue."
+
+        return None   # not a light command — let LLM handle it
 
     def run(self):
         #self.tts.speak("Voice assistant ready. How can I help you?")
@@ -429,6 +516,13 @@ class VoiceAssistant:
                 if any(w in lower for w in ["goodbye", "bye", "exit", "quit", "stop"]):
                     self.tts.speak("Goodbye!")
                     break
+
+                # Handle light commands
+                light_response = self.handle_light_command(text)
+                if light_response:
+                    console.print(f"[bold yellow]Light:[/bold yellow] {light_response}")
+                    self.tts.speak(light_response)
+                    continue
 
                 # 3. LLM inference
                 console.print("[cyan]Thinking...[/cyan]")
